@@ -78,6 +78,8 @@ fn main() -> Result<(), Box<dyn Error + 'static>> {
 			println!("    num_palette_sets: {}", image_def.num_palette_sets);
 			println!("    num_sprites: {}", image_def.num_sprites);
 			println!("    num_subimages: {}", image_def.num_subimages);
+			println!("    pixel_data_index: {}", pixel_data_index);
+			println!("    end_index: {}", end_index);
 		}
 
 		// get color palettes
@@ -98,8 +100,17 @@ fn main() -> Result<(), Box<dyn Error + 'static>> {
 		// get pixel data for each sprite
 		let mut pixel_data_per_sprite = Vec::new();
 		if let CompressionType::None = image_def.compression {
-			// if uncompressed, just grab 2 bytes per pixel per sprite
-			let bytes_per_sprite = image_def.sprite_width_px * image_def.sprite_height_px * 2;
+			// if uncompressed, each sprite has a fixed size
+			let bytes_per_sprite = if let PixelDataType::Bpp(bpp) = image_def.pixel_data_type {
+				let bits_per_sprite = image_def.sprite_width_px * image_def.sprite_height_px * bpp;
+				if bits_per_sprite % 8 == 0 {
+					bits_per_sprite / 8
+				} else {
+					bits_per_sprite / 8 + 1
+				}
+			} else {
+				image_def.sprite_width_px * image_def.sprite_height_px * 2
+			};
 			for j in 0..image_def.num_sprites {
 				let offset = bytes_per_sprite * j;
 				pixel_data_per_sprite.push(&raw_pixel_data[offset..(offset + bytes_per_sprite)]);
@@ -110,8 +121,8 @@ fn main() -> Result<(), Box<dyn Error + 'static>> {
 			for _ in 0..image_def.num_sprites {
 				let offset = buf.get_u32_le() as usize;
 				let length = buf.get_u32_le() as usize;
-				println!("offset: {}, length: {}", offset, length);
-				pixel_data_per_sprite.push(&raw_pixel_data[offset..(offset + length)]);
+				// println!("offset: {}, length: {}", offset, length);
+				// pixel_data_per_sprite.push(&raw_pixel_data[offset..(offset + length)]);
 			}
 		}
 
@@ -133,7 +144,7 @@ fn main() -> Result<(), Box<dyn Error + 'static>> {
 			};
 
 			// TEMP: save each sprite
-			let _ = sprite.save(format!("{}image{}-sprite{}.png", output_path, i, j));
+			sprite.save(format!("{}image{}-sprite{}.png", output_path, i, j)).expect("failed to save");
 			sprites.push(sprite);
 		}
 
@@ -148,21 +159,23 @@ fn read_image_def(mut bytes: Bytes) -> ImageDef {
 
 	// read flags
 	let flags = bytes.get_u8();
-	let has_transparency = (flags & 0b00100000) > 0;
-	let compression = if (flags & 0b00000100) > 0 {
+	let has_transparency = (flags & 0b00000100) > 0;
+	let compression = if (flags & 0b00100000) > 0 {
 		CompressionType::Bytewise
-	} else if (flags & 0b00000010) > 0 {
+	} else if (flags & 0b01000000) > 0 {
 		CompressionType::Wordwise
 	} else {
 		CompressionType::None
 	};
-	let is_encrypted = (flags & 0b00000001) > 0;
+	let is_encrypted = (flags & 0b10000000) > 0;
 
-	let bpp = bytes.get_u8() as usize;
-	let pixel_data_type = if bpp < 16 {
-		PixelDataType::Bpp(bpp)
-	} else {
-		PixelDataType::Direct
+	// determine bpp
+	let pixel_data_type = match bytes.get_u8() {
+		0 => PixelDataType::Bpp(1),
+		1 => PixelDataType::Bpp(2),
+		2 => PixelDataType::Bpp(4),
+		3 => PixelDataType::Bpp(8),
+		_ => PixelDataType::Direct
 	};
 
 	// read other properties
@@ -205,6 +218,13 @@ fn read_image_def(mut bytes: Bytes) -> ImageDef {
 	}
 }
 
+fn parse_rgb565(value: u16) -> Rgba<u8> {
+	let r = (value >> 11) * 255 / 31;
+	let g = ((value >> 5) & 0b111111) * 255 / 63;
+	let b = (value & 0b11111) * 255 / 31;
+	Rgba([r as u8, g as u8, b as u8, 255])
+}
+
 fn get_palette_sets(bytes: &[u8], colors_per_palette: usize, num_palette_sets: usize) -> Vec<Vec<Rgba<u8>>> {
 	let mut buf = Bytes::copy_from_slice(bytes);
 	let mut palette_sets = vec![Vec::new(); num_palette_sets];
@@ -213,10 +233,8 @@ fn get_palette_sets(bytes: &[u8], colors_per_palette: usize, num_palette_sets: u
 	let mut colors = Vec::new();
 	while buf.remaining() >= 2 {
 		let value = buf.get_u16_le();
-		let r = (value >> 8) as u8;
-		let g = (value >> 3) as u8;
-		let b = (value << 3) as u8;
-		colors.push(Rgba([r, g, b, 255]));
+		let color = parse_rgb565(value);
+		colors.push(color);
 	}
 
 	// assign colors to palettes
@@ -231,7 +249,6 @@ fn get_palette_sets(bytes: &[u8], colors_per_palette: usize, num_palette_sets: u
 }
 
 fn decrypt_pixel_data(data: &[u8]) -> Vec<u8> {
-	println!("decrypting...");
 	data.iter().map(|byte| byte ^ 0x53).collect()
 }
 
@@ -305,7 +322,7 @@ fn make_indexed_sprite(bytes: &[u8], image_def: &ImageDef, bpp: usize, palette: 
 
 	// add bits to end of stream in least-significant order
 	let mut bits = Vec::new();
-	while bytes.remaining() >= 1 {
+	while buf.remaining() >= 1 {
 		bits.extend(byte_to_bits(buf.get_u8()));
 	}
 
@@ -315,7 +332,7 @@ fn make_indexed_sprite(bytes: &[u8], image_def: &ImageDef, bpp: usize, palette: 
 	// convert each chunk into a palette index and draw pixel
 	for (i, chunk) in chunks.enumerate() {
 		let x = i % image_def.sprite_width_px;
-		let y = i / image_def.sprite_height_px;
+		let y = i / image_def.sprite_width_px;
 		let index = bits_to_byte(chunk) as usize;
 		let color = if image_def.has_transparency && index == image_def.transparent_color_index as usize {
 			Rgba([0, 0, 0, 0])
@@ -334,12 +351,9 @@ fn make_direct_sprite(bytes: &[u8], image_def: &ImageDef) -> RgbaImage {
 	let mut i = 0;
 	while bytes.remaining() >= 2 {
 		let x = i % image_def.sprite_width_px;
-		let y = i / image_def.sprite_height_px;
+		let y = i / image_def.sprite_width_px;
 		let value = buf.get_u16_le();
-		let r = (value >> 8) as u8;
-		let g = (value >> 3) as u8;
-		let b = (value << 3) as u8;
-		let mut color = Rgba([r, g, b, 255]);
+		let mut color = parse_rgb565(value);
 		if image_def.has_transparency && image_def.transparent_color_index == value {
 			color = Rgba([0, 0, 0, 0]);
 		}
