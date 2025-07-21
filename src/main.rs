@@ -2,7 +2,7 @@ use std::error::Error;
 use std::env::args;
 use std::fs;
 use bytes::{ Bytes, Buf };
-use image::{ Rgba, RgbaImage };
+use image::{ Rgba, RgbaImage, GenericImage };
 
 // Format: https://gist.github.com/GMMan/a467961057d1e9fb08a2bbfd553180d6
 
@@ -58,9 +58,8 @@ fn main() -> Result<(), Box<dyn Error + 'static>> {
 		image_offsets.push(image_offset);
 		current_offset += 4;
 	}
-	println!("Image Count: {}", image_offsets.len());
 
-	for (i, image_offset) in image_offsets.iter().enumerate() {
+	for (i, image_offset) in image_offsets[50..100].iter().enumerate() {
 		let image_buffer = Bytes::copy_from_slice(&data[*image_offset as usize..]);
 		let image_def = read_image_def(image_buffer);
 
@@ -70,18 +69,6 @@ fn main() -> Result<(), Box<dyn Error + 'static>> {
 		let pixel_data_index = start_index + image_def.pixel_data_offset;
 		let end_index = start_index + image_def.data_length;
 
-		if i < 10 {
-			println!("\nImage {}", i);
-			println!("    encrypted: {:?}", image_def.is_encrypted);
-			println!("    compressed: {:?}", image_def.compression);
-			println!("    pixel_data_type: {:?}", image_def.pixel_data_type);
-			println!("    num_palette_sets: {}", image_def.num_palette_sets);
-			println!("    num_sprites: {}", image_def.num_sprites);
-			println!("    num_subimages: {}", image_def.num_subimages);
-			println!("    pixel_data_index: {}", pixel_data_index);
-			println!("    end_index: {}", end_index);
-		}
-
 		// get color palettes
 		let mut palette_sets = Vec::new();
 		if let PixelDataType::Bpp(bpp) = image_def.pixel_data_type {
@@ -90,65 +77,21 @@ fn main() -> Result<(), Box<dyn Error + 'static>> {
 			palette_sets = get_palette_sets(palette_data, colors_per_palette, image_def.num_palette_sets);
 		}
 
-		// decrypt pixel data
-		let raw_pixel_data = if image_def.is_encrypted {
-			decrypt_pixel_data(&data[pixel_data_index..end_index])
-		} else {
-			data[pixel_data_index..end_index].to_vec()
-		};
-
 		// get pixel data for each sprite
-		let mut pixel_data_per_sprite = Vec::new();
-		if let CompressionType::None = image_def.compression {
-			// if uncompressed, each sprite has a fixed size
-			let bytes_per_sprite = if let PixelDataType::Bpp(bpp) = image_def.pixel_data_type {
-				let bits_per_sprite = image_def.sprite_width_px * image_def.sprite_height_px * bpp;
-				if bits_per_sprite % 8 == 0 {
-					bits_per_sprite / 8
-				} else {
-					bits_per_sprite / 8 + 1
-				}
-			} else {
-				image_def.sprite_width_px * image_def.sprite_height_px * 2
-			};
-			for j in 0..image_def.num_sprites {
-				let offset = bytes_per_sprite * j;
-				pixel_data_per_sprite.push(&raw_pixel_data[offset..(offset + bytes_per_sprite)]);
-			}
-		} else {
-			// if compressed, get offsets + lengths and use those to get pixel data per sprite
-			let mut buf = Bytes::copy_from_slice(&raw_pixel_data);
-			for _ in 0..image_def.num_sprites {
-				let offset = buf.get_u32_le() as usize;
-				let length = buf.get_u32_le() as usize;
-				// println!("offset: {}, length: {}", offset, length);
-				// pixel_data_per_sprite.push(&raw_pixel_data[offset..(offset + length)]);
-			}
-		}
+		let pixel_data = get_pixel_data(&data[pixel_data_index..end_index], &image_def);
 
 		// draw each sprite
-		let mut sprites = Vec::new();
-		for (j, raw_pixel_data_for_sprite) in pixel_data_per_sprite.iter().enumerate() {
-			// decompress pixel data
-			let pixel_data = match image_def.compression {
-				CompressionType::None => raw_pixel_data_for_sprite.to_vec(),
-				CompressionType::Bytewise => decompress_bytewise(&raw_pixel_data_for_sprite),
-				CompressionType::Wordwise => decompress_wordwise(&raw_pixel_data_for_sprite)
-			};
+		let sprites: Vec<RgbaImage> = pixel_data.iter().map(|pixel_data|
+			make_sprite(pixel_data, &image_def, &palette_sets)
+		).collect();
 
-			// convert pixel data to images
-			let sprite = if let PixelDataType::Bpp(bpp) = image_def.pixel_data_type {
-				make_indexed_sprite(&pixel_data, &image_def, bpp, &palette_sets[0])
-			} else {
-				make_direct_sprite(&pixel_data, &image_def)
-			};
-
-			// TEMP: save each sprite
-			sprite.save(format!("{}image{}-sprite{}.png", output_path, i, j)).expect("failed to save");
-			sprites.push(sprite);
+		// combine sprites into subimages
+		for j in 0..image_def.num_subimages {
+			let subimage = make_subimage(&sprites, &image_def);
+			subimage.save(format!("{}image{}-{}.png", output_path, i, j)).expect("failed to save");
 		}
 
-		// TODO: combine sprites into subimages
+		// combine subimages into spritesheets
 	}
 
 	Ok(())
@@ -259,14 +202,12 @@ fn decompress_bytewise(bytes: &[u8]) -> Vec<u8> {
 		let control = buf.get_u8();
 		let top_bit = control >> 7;
 		let n = control & 0x7f;
-		if top_bit == 1 {
-			// add next n chunks
+		if top_bit == 1 && buf.remaining() >= n as usize {
 			for _ in 0..n {
 				let value = buf.get_u8();
 				chunks.push(value);
 			}
-		} else {
-			// repeat [value] n times
+		} else if top_bit == 0 && buf.remaining() >= 1 {
 			let value = buf.get_u8();
 			for _ in 0..n {
 				chunks.push(value);
@@ -300,6 +241,58 @@ fn decompress_wordwise(bytes: &[u8]) -> Vec<u8> {
 	chunks
 }
 
+fn get_pixel_data(data: &[u8], def: &ImageDef) -> Vec<Vec<u8>> {
+	if let CompressionType::None = def.compression {
+		get_uncompressed_pixel_data(data, def)
+	} else {
+		get_compressed_pixel_data(data, def)
+	}
+}
+
+fn get_uncompressed_pixel_data(data: &[u8], def: &ImageDef) -> Vec<Vec<u8>> {
+	// if uncompressed, each sprite has a fixed size
+	let bytes_per_sprite = if let PixelDataType::Bpp(bpp) = def.pixel_data_type {
+		let bits_per_sprite = def.sprite_width_px * def.sprite_height_px * bpp;
+		if bits_per_sprite % 8 == 0 {
+			bits_per_sprite / 8
+		} else {
+			bits_per_sprite / 8 + 1
+		}
+	} else {
+		def.sprite_width_px * def.sprite_height_px * 2
+	};
+
+	let mut pixel_data_per_sprite = Vec::new();
+	for j in 0..def.num_sprites {
+		let a = bytes_per_sprite * j;
+		let b = a + bytes_per_sprite;
+		let pixel_data = if def.is_encrypted {
+			decrypt_pixel_data(&data[a..b])
+		} else {
+			data[a..b].to_vec()
+		};
+		pixel_data_per_sprite.push(pixel_data);
+	}
+	pixel_data_per_sprite
+}
+
+fn get_compressed_pixel_data(data: &[u8], def: &ImageDef) -> Vec<Vec<u8>> {
+	// if compressed, get offsets + lengths and use those to get pixel data per sprite
+	let mut pixel_data_per_sprite = Vec::new();
+	let mut buf = Bytes::copy_from_slice(data);
+	for _ in 0..def.num_sprites {
+		let a = buf.get_u32_le() as usize;
+		let b = a + buf.get_u32_le() as usize;
+		let pixel_data = if def.is_encrypted {
+			decrypt_pixel_data(&data[a..b])
+		} else {
+			data[a..b].to_vec()
+		};
+		pixel_data_per_sprite.push(pixel_data);
+	}
+	pixel_data_per_sprite
+}
+
 fn byte_to_bits(byte: u8) -> Vec<u8> {
 	let mut bits = Vec::new();
 	for i in 0..8 {
@@ -316,8 +309,26 @@ fn bits_to_byte(bits: &[u8]) -> u8 {
 	byte
 }
 
-fn make_indexed_sprite(bytes: &[u8], image_def: &ImageDef, bpp: usize, palette: &[Rgba<u8>]) -> RgbaImage {
-	let mut img = RgbaImage::new(image_def.sprite_width_px as u32, image_def.sprite_height_px as u32);
+fn make_sprite(data: &[u8], def: &ImageDef, palettes: &[Vec<Rgba<u8>>]) -> RgbaImage {
+	// decompress pixel data
+	let pixel_data = match def.compression {
+		CompressionType::None => data.to_vec(),
+		CompressionType::Bytewise => decompress_bytewise(&data),
+		CompressionType::Wordwise => decompress_wordwise(&data)
+	};
+
+	// convert pixel data to images
+	let sprite = if let PixelDataType::Bpp(bpp) = def.pixel_data_type {
+		make_indexed_sprite(&pixel_data, &def, bpp, &palettes[0])
+	} else {
+		make_direct_sprite(&pixel_data, &def)
+	};
+
+	sprite
+}
+
+fn make_indexed_sprite(bytes: &[u8], def: &ImageDef, bpp: usize, palette: &[Rgba<u8>]) -> RgbaImage {
+	let mut img = RgbaImage::new(def.sprite_width_px as u32, def.sprite_height_px as u32);
 	let mut buf = Bytes::copy_from_slice(bytes);
 
 	// add bits to end of stream in least-significant order
@@ -331,30 +342,32 @@ fn make_indexed_sprite(bytes: &[u8], image_def: &ImageDef, bpp: usize, palette: 
 
 	// convert each chunk into a palette index and draw pixel
 	for (i, chunk) in chunks.enumerate() {
-		let x = i % image_def.sprite_width_px;
-		let y = i / image_def.sprite_width_px;
-		let index = bits_to_byte(chunk) as usize;
-		let color = if image_def.has_transparency && index == image_def.transparent_color_index as usize {
-			Rgba([0, 0, 0, 0])
-		} else {
-			palette.get(index).expect("color index is out of range for given palette").clone()
-		};
-		img.put_pixel(x as u32, y as u32, color);
+		let x = i % def.sprite_width_px;
+		let y = i / def.sprite_width_px;
+		if x < def.sprite_width_px && y < def.sprite_height_px {
+			let index = bits_to_byte(chunk) as usize;
+			let color = if def.has_transparency && index == def.transparent_color_index as usize {
+				Rgba([0, 0, 0, 0])
+			} else {
+				palette.get(index).expect("color index is out of range for given palette").clone()
+			};
+			img.put_pixel(x as u32, y as u32, color);
+		}
 	}
 
 	img
 }
 
-fn make_direct_sprite(bytes: &[u8], image_def: &ImageDef) -> RgbaImage {
-	let mut img = RgbaImage::new(image_def.sprite_width_px as u32, image_def.sprite_height_px as u32);
+fn make_direct_sprite(bytes: &[u8], def: &ImageDef) -> RgbaImage {
+	let mut img = RgbaImage::new(def.sprite_width_px as u32, def.sprite_height_px as u32);
 	let mut buf = Bytes::copy_from_slice(bytes);
 	let mut i = 0;
 	while bytes.remaining() >= 2 {
-		let x = i % image_def.sprite_width_px;
-		let y = i / image_def.sprite_width_px;
+		let x = i % def.sprite_width_px;
+		let y = i / def.sprite_width_px;
 		let value = buf.get_u16_le();
 		let mut color = parse_rgb565(value);
-		if image_def.has_transparency && image_def.transparent_color_index == value {
+		if def.has_transparency && def.transparent_color_index == value {
 			color = Rgba([0, 0, 0, 0]);
 		}
 		img.put_pixel(x as u32, y as u32, color);
@@ -362,3 +375,19 @@ fn make_direct_sprite(bytes: &[u8], image_def: &ImageDef) -> RgbaImage {
 	}
 	img
 }
+
+fn make_subimage(sprites: &[RgbaImage], def: &ImageDef) -> RgbaImage {
+	let width = def.sprite_width_px * def.image_width;
+	let height = def.sprite_height_px * def.image_height;
+	let mut img = RgbaImage::new(width as u32, height as u32);
+	for (i, sprite) in sprites.iter().enumerate() {
+		let x = (i % def.image_width) * def.sprite_width_px;
+		let y = (i / def.image_width) * def.sprite_height_px;
+		img.copy_from(sprite, x as u32, y as u32).expect("unable to copy sprite into subimage");
+	}
+	img
+}
+
+// fn make_spritesheet(subimages: &[RgbaImage], def: &ImageDef) -> RgbaImage {
+
+// }
